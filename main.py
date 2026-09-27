@@ -1,6 +1,7 @@
 import os, time, requests, threading
 import yfinance as yf
 import pandas as pd
+import numpy as np
 from datetime import datetime
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -15,109 +16,64 @@ def reply_to_user(chat_id, msg):
     requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
 
 def get_xau_data():
-    # FIXED: Use history() - no MultiIndex bug
     ticker = yf.Ticker("GC=F")
-    data = ticker.history(interval="5m", period="2d")
-    data = data.dropna()
-    return data
+    df = ticker.history(interval="5m", period="2d")
+    df = df.dropna()
+    print(f"Data shape: {df.shape}, columns: {list(df.columns)}")
+    return df
 
 def gainzalgo_logic(df):
     if len(df) < 30:
+        print("Not enough data")
         return None
     
-    # FORCE to Series with .squeeze and float
-    close = df['Close']
-    high = df['High']
-    low = df['Low']
+    # USE VALUES - NO SERIES BUG EVER
+    close_vals = df['Close'].values
+    high_vals = df['High'].values
+    low_vals = df['Low'].values
 
-    ema_fast = close.ewm(span=21).mean()
-    ema_slow = close.ewm(span=50).mean()
+    # EMA manual calc to avoid Series
+    def ema(values, span):
+        return pd.Series(values).ewm(span=span).mean().values
+
+    ema_fast_vals = ema(close_vals, 21)
+    ema_slow_vals = ema(close_vals, 50)
     
-    sma20 = close.rolling(20).mean()
-    std20 = close.rolling(20).std()
+    sma20 = pd.Series(close_vals).rolling(20).mean().values
+    std20 = pd.Series(close_vals).rolling(20).std().values
     bb_upper = sma20 + 2*std20
     bb_lower = sma20 - 2*std20
     bb_width = (bb_upper - bb_lower) / sma20
 
-    # SAFE float conversion
-    try:
-        c = float(close.iloc[-1])
-        ef = float(ema_fast.iloc[-1])
-        es = float(ema_slow.iloc[-1])
-        bw = float(bb_width.iloc[-1])
-        bw1 = float(bb_width.iloc[-2])
-        bw2 = float(bb_width.iloc[-3])
-        h = float(high.iloc[-1])
-        l = float(low.iloc[-1])
-        h_prev = float(high.iloc[-2])
-        l_prev = float(low.iloc[-2])
-        last_high = float(high.rolling(10).max().iloc[-2])
-        last_low = float(low.rolling(10).min().iloc[-2])
-    except Exception as e:
-        print(f"Convert error: {e}")
-        return None
+    c = float(close_vals[-1])
+    h = float(high_vals[-1])
+    l = float(low_vals[-1])
+    h_prev = float(high_vals[-2])
+    l_prev = float(low_vals[-2])
+    ef = float(ema_fast_vals[-1])
+    es = float(ema_slow_vals[-1])
+    bw = float(bb_width[-1])
+    bw1 = float(bb_width[-2])
+    bw2 = float(bb_width[-3])
+
+    # rolling 10 max/min using numpy
+    last_high = float(np.max(high_vals[-11:-1]))
+    last_low = float(np.min(low_vals[-11:-1]))
 
     trend_up = ef > es
     trend_down = ef < es
-    expansion = bw > bw1 and bw1 < bw2
-    sweep_high = h > last_high and c < last_high
-    sweep_low = l < last_low and c > last_low
+    expansion = (bw > bw1) and (bw1 < bw2)
+    sweep_high = (h > last_high) and (c < last_high)
+    sweep_low = (l < last_low) and (c > last_low)
     bos_up = c > h_prev
     bos_down = c < l_prev
 
-    price = c
+    print(f"Check: c={c:.2f} ef={ef:.2f} es={es:.2f} trend_down={trend_down} exp={expansion} sweepH={sweep_high} bosD={bos_down}")
 
+    price = c
     if trend_down and expansion and sweep_high and bos_down:
         sl = price + 3.5
         tp1 = price - 5.0
         tp2 = price - 9.0
         tp3 = price - 15.0
-        return f"🔴 *GAINZALGO V2 STYLE - SELL XAUUSD*\n\nPrice: {price:.2f}\nTrend: BEARISH ✅\nSetup: Liquidity Sweep + BOS + Expansion ✅\n\nSL: {sl:.2f}\nTP1: {tp1:.2f} (safe)\nTP2: {tp2:.2f}\nTP3: {tp3:.2f}\n\nRisk: 0.01 lot = ~$3.5 risk\nTime: {datetime.now().strftime('%H:%M')}\n\n⚠️ SAFE MODE"
-
-    if trend_up and expansion and sweep_low and bos_up:
-        sl = price - 3.5
-        tp1 = price + 5.0
-        tp2 = price + 9.0
-        tp3 = price + 15.0
-        return f"🟢 *GAINZALGO V2 STYLE - BUY XAUUSD*\n\nPrice: {price:.2f}\nTrend: BULLISH ✅\nSetup: Liquidity Sweep + BOS + Expansion ✅\n\nSL: {sl:.2f}\nTP1: {tp1:.2f} (safe)\nTP2: {tp2:.2f}\nTP3: {tp3:.2f}\n\nRisk: 0.01 lot = ~$3.5 risk\nTime: {datetime.now().strftime('%H:%M')}\n\n⚠️ SAFE MODE"
-    return None
-
-def telegram_listener():
-    offset = 0
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={offset}&timeout=30"
-            r = requests.get(url, timeout=35).json()
-            for update in r.get("result", []):
-                offset = update["update_id"] + 1
-                msg = update.get("message", {})
-                text = msg.get("text", "").lower()
-                cid = msg.get("chat", {}).get("id")
-                if text in ["/start", "start"]:
-                    reply_to_user(cid, "✅ *BOT 3 FAST ONLINE!*\n90% V2 Alpha - FIXED\nChecking every 30sec! ⚡")
-                elif text == "/status":
-                    reply_to_user(cid, "📊 RUNNING 30sec FAST MODE - FIXED")
-        except:
-            time.sleep(5)
-
-threading.Thread(target=telegram_listener, daemon=True).start()
-
-print("BOT 3 GainzAlgo Safe Started - XAUUSD 5m - FIXED VERSION")
-last_signal_time = 0
-while True:
-    try:
-        df = get_xau_data()
-        signal = gainzalgo_logic(df)
-        now = time.time()
-        if signal and (now - last_signal_time) > 600:
-            send_telegram(signal)
-            print(f"Signal sent: {signal[:20]}")
-            last_signal_time = now
-        else:
-            print(f"Checking... Price {float(df['Close'].iloc[-1]):.2f} - No setup")
-        time.sleep(30)
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        time.sleep(30)
+        return f"🔴 *GAINZALGO V2 STYLE - SELL
