@@ -1,187 +1,245 @@
 from flask import Flask
 import threading, time, requests, os
-import pandas as pd
 import yfinance as yf
+import pandas as pd
 
 app = Flask(__name__)
-
-# ========== CONFIG - REAL GOLD ONANA ==========
+# ========== REAL GOLD ONANA CONFIG ==========
 SYMBOL = "XAUUSD"
-YF_SYMBOL = "GC=F" # for data, proxy for XAUUSD spot
-TF = "15m" # use 15m for REAL setup, not noisy 1m
+YF = "GC=F"
 LIVE = True
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
-EMA_FAST = 50
-EMA_SLOW = 200
-ADX_MIN = 22
-COOLDOWN = 45*60 # 45 min no spam - ONLY REAL SETUP
-last_signal_time = 0
-active_trade = None
 last_price = 0
+last_signal = 0
+active_trade = None
+COOLDOWN = 40*60
 
-# ========== HEALTH FOR UPTIMEROBOT ==========
 @app.route('/')
-def home():
-    return f"✅ GAINZALGO {SYMBOL} LIVE - FVG+OB+RETEST - Price:{last_price}", 200
-
+def home(): return f"✅ GAINZALGO V2 {SYMBOL} LIVE 1H/15M/5M Price:{last_price}", 200
 @app.route('/health')
 def health(): return "OK", 200
 
-# ========== DATA ==========
-def get_candles():
-    global last_price
+# ========== DATA MULTI-TF ==========
+def get_tf(interval, period):
     try:
-        df = yf.download(YF_SYMBOL, period="5d", interval="15m", progress=False)
+        df = yf.download(YF, period=period, interval=interval, progress=False)
         df = df.dropna()
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        # EMA
-        df['EMA50'] = df['Close'].ewm(span=EMA_FAST).mean()
-        df['EMA200'] = df['Close'].ewm(span=EMA_SLOW).mean()
-        # ADX simple filter using EMA distance
-        df['trend_strength'] = abs(df['EMA50'] - df['EMA200'])
-        last_price = float(df['Close'].iloc[-1])
+        df['EMA50'] = df['Close'].ewm(50).mean()
+        df['EMA200'] = df['Close'].ewm(200).mean()
         return df
-    except Exception as e:
-        print(f"Data error: {e}")
-        return None
+    except: return None
 
-# ========== SMC LOGIC ==========
-def find_bullish_fvg(df):
-    # FVG: candle1 high < candle3 low and middle is gap
-    fvg_zones = []
-    for i in range(2, len(df)-1):
-        c1_high = df['High'].iloc[i-2]
-        c3_low = df['Low'].iloc[i]
-        c2 = df.iloc[i-1]
-        if c1_high < c3_low and (c3_low - c1_high) > 1.5: # $1.5 gap min
-            fvg_zones.append((float(c1_high), float(c3_low), i))
-    return fvg_zones[-3:] if fvg_zones else []
+# ========== MARKET STRUCTURE HH HL LL LH ==========
+def get_structure(df):
+    # last 20 candles
+    highs = df['High'].tail(20)
+    lows = df['Low'].tail(20)
+    # HH HL = bullish, LL LH = bearish
+    is_hh_hl = highs.iloc[-1] > highs.iloc[-3] and lows.iloc[-1] > lows.iloc[-3]
+    is_ll_lh = highs.iloc[-1] < highs.iloc[-3] and lows.iloc[-1] < lows.iloc[-3]
+    if is_hh_hl: return "BULLISH HH-HL"
+    if is_ll_lh: return "BEARISH LL-LH"
+    return "RANGE"
 
-def find_bullish_ob(df):
-    # OB: last bearish candle before big bullish impulse
-    obs = []
-    for i in range(1, len(df)-2):
-        # bearish then bullish impulse > $3
-        if df['Close'].iloc[i] < df['Open'].iloc[i] and df['Close'].iloc[i+1] - df['Open'].iloc[i+1] > 3:
-            ob_high = float(df['High'].iloc[i])
-            ob_low = float(df['Low'].iloc[i])
-            obs.append((ob_low, ob_high, i))
-    return obs[-3:] if obs else []
+# ========== REAL FVG 3 CANDLE IMBALANCE ==========
+def find_real_fvg(df):
+    bull_fvg, bear_fvg = [], []
+    for i in range(1, len(df)-1):
+        c1 = df.iloc[i-1]
+        c2 = df.iloc[i]
+        c3 = df.iloc[i+1]
+        # BULLISH FVG: c1 High < c3 Low = imbalance, c2 is big
+        if c1['High'] < c3['Low'] and (c3['Low'] - c1['High']) > 1.2:
+            bull_fvg.append((float(c1['High']), float(c3['Low']), i, float(c2['Close'])))
+        # BEARISH FVG: c1 Low > c3 High
+        if c1['Low'] > c3['High'] and (c1['Low'] - c3['High']) > 1.2:
+            bear_fvg.append((float(c3['High']), float(c1['Low']), i, float(c2['Close'])))
+    return bull_fvg[-3:], bear_fvg[-3:]
 
-def find_demand_zone(df):
-    # Support/Demand: swing low with rejection
-    demand = []
-    for i in range(2, len(df)-2):
-        low = df['Low'].iloc[i]
-        if low < df['Low'].iloc[i-1] and low < df['Low'].iloc[i-2] and low < df['Low'].iloc[i+1] and low < df['Low'].iloc[i+2]:
-            demand.append((float(low-1), float(low+2), i))
-    return demand[-2:] if demand else []
+# ========== OB ==========
+def find_ob(df):
+    bull_ob, bear_ob = [], []
+    for i in range(len(df)-3):
+        if df['Close'].iloc[i] < df['Open'].iloc[i] and df['Close'].iloc[i+1] - df['Open'].iloc[i+1] > 2.5:
+            bull_ob.append((float(df['Low'].iloc[i]), float(df['High'].iloc[i]), i))
+        if df['Close'].iloc[i] > df['Open'].iloc[i] and df['Open'].iloc[i+1] - df['Close'].iloc[i+1] > 2.5:
+            bear_ob.append((float(df['Low'].iloc[i]), float(df['High'].iloc[i]), i))
+    return bull_ob[-2:], bear_ob[-2:]
 
-def check_rejection_confirmation(df):
-    # Rejection: hammer / bullish engulfing / wick rejection at zone
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    body = abs(last['Close'] - last['Open'])
-    lower_wick = min(last['Open'], last['Close']) - last['Low']
-    # 1. Hammer rejection
-    hammer = lower_wick > body*1.8 and last['Close'] > last['Open']
-    # 2. Bullish engulfing
-    engulf = last['Close'] > prev['Open'] and last['Open'] < prev['Close'] and last['Close'] > prev['High']
-    # 3. Wick rejection
-    wick_rej = last['Low'] < prev['Low'] and last['Close'] > (last['High']+last['Low'])/2
-    return hammer or engulf or wick_rej
+# ========== BOS / CHoCH ON 5M ==========
+def check_bos_choch_5m():
+    df5 = get_tf("5m", "2d")
+    if df5 is None: return None, None
+    # BOS bullish: close above last high
+    last_high = df5['High'].tail(10).max()
+    last_low = df5['Low'].tail(10).min()
+    curr = df5.iloc[-1]
+    prev = df5.iloc[-2]
+    bos_bull = curr['Close'] > last_high and prev['Close'] < last_high
+    bos_bear = curr['Close'] < last_low and prev['Close'] > last_low
+    # CHoCH
+    choch_bull = curr['Close'] > df5['High'].iloc[-5] and get_structure(df5) == "BULLISH HH-HL"
+    choch_bear = curr['Close'] < df5['Low'].iloc[-5] and get_structure(df5) == "BEARISH LL-LH"
 
-# ========== TELEGRAM ==========
+    if bos_bull or choch_bull: return "BULLISH BOS/CHoCH 5M", df5
+    if bos_bear or choch_bear: return "BEARISH BOS/CHoCH 5M", df5
+    return None, df5
+
 def send_tg(msg):
     try:
         if not BOT_TOKEN: return
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                       data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
-        print(f"Sent: {msg[:100]}")
     except Exception as e: print(e)
 
-# ========== MAIN BOT LOGIC - LONG ONLY REAL SETUP ==========
-def check_long_setup():
-    global last_signal_time, active_trade
-    df = get_candles()
-    if df is None or len(df) < 210: return
+# ========== MAIN LOGIC 1H ANALYSE / 15M EXEC / 5M BOS ==========
+def check_setup():
+    global last_price, last_signal, active_trade
 
-    price = float(df['Close'].iloc[-1])
-    ema50 = float(df['EMA50'].iloc[-1])
-    ema200 = float(df['EMA200'].iloc[-1])
-    trend_strength = float(df['trend_strength'].iloc[-1])
-
-    # --- FILTERS - NO NOISE ---
-    if time.time() - last_signal_time < COOLDOWN: return
-    if price < ema200: return # ONLY LONG ABOVE EMA200
-    if price < ema50: return
-    if trend_strength < 2.0: return # weak trend filter (proxy ADX)
+    if time.time() - last_signal < COOLDOWN: return
     if active_trade:
-        check_tp_sl_hit(price)
+        df15 = get_tf("15m", "5d")
+        if df15 is not None: check_hit(float(df15['Close'].iloc[-1]))
         return
 
-    fvg_zones = find_bullish_fvg(df)
-    ob_zones = find_bullish_ob(df)
-    demand_zones = find_demand_zone(df)
+    # 1. 1H ANALYSIS
+    df1h = get_tf("1h", "20d")
+    if df1h is None: return
+    structure_1h = get_structure(df1h)
+    trend_1h = "BULLISH" if df1h['Close'].iloc[-1] > df1h['EMA200'].iloc[-1] else "BEARISH"
+    print(f"1H: {trend_1h} | {structure_1h}")
 
-    # Check if price is retesting a zone NOW
-    in_zone = False
-    zone_type = ""
-    zone_low = zone_high = 0
+    # 2. 15M EXECUTION - FVG + OB
+    df15 = get_tf("15m", "5d")
+    if df15 is None: return
+    bull_fvg, bear_fvg = find_real_fvg(df15)
+    bull_ob, bear_ob = find_ob(df15)
+    price = float(df15['Close'].iloc[-1])
+    last_price = price
 
-    for low, high, idx in fvg_zones + ob_zones + demand_zones:
-        # Price retesting zone (within 0.5$)
-        if low-0.5 <= price <= high+0.5:
-            in_zone = True
-            zone_low, zone_high = low, high
-            if (low, high, idx) in fvg_zones: zone_type = "BULLISH FVG"
-            elif (low, high, idx) in ob_zones: zone_type = "BULLISH OB"
-            else: zone_type = "DEMAND ZONE"
-            break
+    # 3. 5M BOS/CHoCH CONFIRMATION
+    bos_signal, df5 = check_bos_choch_5m()
+    if not bos_signal: return # NEED 5M BOS/CHoCH
 
-    if not in_zone: return
+    print(f"5M: {bos_signal}")
 
-    # --- CONFIRMATION: REJECTION + RETEST ---
-    if not check_rejection_confirmation(df): return # NEED rejection!
+    # --- LONG SETUP: 1H BULLISH + 15M BULL FVG/OB RETEST + 5M BULLISH BOS + CLOSE CONFIRM ---
+    if "BULLISH" in bos_signal and trend_1h == "BULLISH":
+        for low, high, idx, mid in bull_fvg + bull_ob:
+            # Price need to ENTER exact zone and CLOSE above zone low (your requirement!)
+            if low-1 <= price <= high+1:
+                # Need close confirmation: close above zone + rejection
+                last_candle = df15.iloc[-1]
+                close_confirmed = last_candle['Close'] > low and last_candle['Close'] > last_candle['Open'] # bullish close
+                wick_reject = (min(last_candle['Open'], last_candle['Close']) - last_candle['Low']) > 1.0
 
-    # --- REAL SETUP FOUND - LONG ---
-    entry = price
-    sl = zone_low - 2.5 # SL below zone + $2.5 buffer
-    risk = entry - sl
-    if risk < 1.5 or risk > 8: return # risk filter no noise
+                if close_confirmed and wick_reject:
+                    entry = price
+                    sl = low - 2.0
+                    risk = entry - sl
+                    if risk < 1.2 or risk > 7: continue
+                    tp1 = entry + risk*2 # 1:2 as you want
+                    tp2 = entry + risk*3
+                    tp3 = entry + risk*4
 
-    tp1 = entry + risk*1.0
-    tp2 = entry + risk*2.0
-    tp3 = entry + risk*3.5
+                    send_tg(f"""🚀 *GAINZALGO LONG - REAL SETUP* LIVE
 
-    msg = f"""🚀 *GAINZALGO REAL LONG SETUP FOUND* - {SYMBOL} LIVE
+1H: {trend_1h} {structure_1h}
+15M: BULLISH FVG/OB RETEST {low:.1f}-{high:.1f}
+5M: {bos_signal} ✅
 
-✅ *{zone_type} + RETEST + REJECTION CONFIRMED*
+*CLOSE CONFIRMED* above {low:.1f} + REJECTION
 
-📍 ENTRY: {entry:.2f} GOLD ONANA SPOT LIVE
-🛑 SL: {sl:.2f} (-${risk:.2f})
-🎯 TP1: {tp1:.2f} (1:1)
-🎯 TP2: {tp2:.2f} (1:2)
-🎯 TP3: {tp3:.2f} (1:3.5)
+ENTRY: {entry:.2f} GOLD ONANA SPOT LIVE
+SL: {sl:.2f} (-${risk:.2f})
+TP1: {tp1:.2f} (1:2)
+TP2: {tp2:.2f} (1:3)
+TP3: {tp3:.2f} (1:4)
 
-📊 Zone: {zone_low:.2f} - {zone_high:.2f}
-EMA50: {ema50:.2f} | EMA200: {ema200:.2f}
-TF: {TF} | No noisy - Real setup only!
+HH-HL + BOS + FVG exact close!
+""")
+                    last_signal = time.time()
+                    active_trade = {"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,"dir":"LONG"}
+                    return
 
-BOT: gainzalgo LIVE + UptimeRobot
-"""
-    send_tg(msg)
-    last_signal_time = time.time()
-    active_trade = {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "type": zone_type}
+    # --- SHORT SETUP: 1H BEARISH + 15M BEAR FVG/OB RETEST + 5M BEARISH BOS + CLOSE CONFIRM ---
+    if "BEARISH" in bos_signal and trend_1h == "BEARISH":
+        for low, high, idx, mid in bear_fvg + bear_ob:
+            if low-1 <= price <= high+1:
+                last_candle = df15.iloc[-1]
+                close_confirmed = last_candle['Close'] < high and last_candle['Close'] < last_candle['Open']
+                wick_reject = (last_candle['High'] - max(last_candle['Open'], last_candle['Close'])) > 1.0
 
-def check_tp_sl_hit(price):
+                if close_confirmed and wick_reject:
+                    entry = price
+                    sl = high + 2.0
+                    risk = sl - entry
+                    if risk < 1.2 or risk > 7: continue
+                    tp1 = entry - risk*2
+                    tp2 = entry - risk*3
+                    tp3 = entry - risk*4
+
+                    send_tg(f"""🔻 *GAINZALGO SHORT - REAL SETUP* LIVE
+
+1H: {trend_1h} {structure_1h}
+15M: BEARISH FVG/OB RETEST {low:.1f}-{high:.1f}
+5M: {bos_signal} ✅
+
+*CLOSE CONFIRMED* below {high:.1f} + REJECTION
+
+ENTRY: {entry:.2f} GOLD ONANA SPOT LIVE
+SL: {sl:.2f} (-${risk:.2f})
+TP1: {tp1:.2f} (1:2)
+TP2: {tp2:.2f} (1:3)
+TP3: {tp3:.2f} (1:4)
+
+LL-LH + BOS + FVG exact close!
+""")
+                    last_signal = time.time()
+                    active_trade = {"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3,"dir":"SHORT"}
+                    return
+
+def check_hit(price):
     global active_trade
     if not active_trade: return
-    sl, tp1, tp2, tp3 = active_trade['sl'], active_trade['tp1'], active_trade['tp2'], active_trade['tp3']
+    sl, tp1, tp2, tp3, dir = active_trade['sl'], active_trade['tp1'], active_trade['tp2'], active_trade['tp3'], active_trade['dir']
 
-    if price <= sl:
-        send_tg(f"❌ *SL HIT* {SYMBOL}\nEntry: {active_trade['entry']:.2f} -> SL: {sl:.2f}\nSetup: {active_trade['type']}")
-        active_trade = None
-    elif price >= tp1 and
+    if dir == "LONG":
+        if price <= sl:
+            send_tg(f"❌ *SL HIT LONG* {price:.2f} Entry {active_trade['entry']:.2f}")
+            active_trade = None
+        elif price >= tp1 and price < tp2:
+            send_tg(f"✅ *TP1 HIT LONG 1:2* {price:.2f}! SL to BE")
+            active_trade['sl'] = active_trade['entry']
+        elif price >= tp2:
+            send_tg(f"✅✅ *TP2 HIT LONG* {price:.2f}!")
+        elif price >= tp3:
+            send_tg(f"🔥 *TP3 HIT LONG FULL* {price:.2f} DONE!")
+            active_trade = None
+    else:
+        if price >= sl:
+            send_tg(f"❌ *SL HIT SHORT* {price:.2f} Entry {active_trade['entry']:.2f}")
+            active_trade = None
+        elif price <= tp1:
+            send_tg(f"✅ *TP1 HIT SHORT 1:2* {price:.2f}! SL to BE")
+            active_trade['sl'] = active_trade['entry']
+        elif price <= tp3:
+            send_tg(f"🔥 *TP3 HIT SHORT FULL* {price:.2f} DONE!")
+            active_trade = None
+
+def bot_loop():
+    send_tg(f"✅ *GAINZALGO V2 ONLINE*\n1H Analyse: HH/HL LL/LH\n15M Exec: Real FVG 3-candle + OB\n5M: BOS/CHoCH Confirm\nLONG+SHORT + Close confirm + 1:2 RR\nREAL GOLD ONANA LIVE!")
+    while True:
+        try:
+            check_setup()
+            time.sleep(60)
+        except Exception as e:
+            print(e)
+            time.sleep(30)
+
+threading.Thread(target=bot_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
