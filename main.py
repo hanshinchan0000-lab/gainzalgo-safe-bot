@@ -1,221 +1,148 @@
-import os, time, requests, traceback, json
-from datetime import datetime, timedelta
+import time
+import requests
+import pandas as pd
+import numpy as np
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-
-# ===== V5 80%+ WR CONFIG =====
+# ========= CONFIG =========
+TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
+CHAT_ID = "YOUR_CHAT_ID"
 SYMBOL = "XAUUSD"
-TP1_POINTS = 13 # SAFE TP - was 6
-TP2_POINTS = 18 # TREND TP - was 12
-SL_POINTS = 9 # SAFE SL - was 5
-TREND_SL = 12
-BREAKEVEN_AT = 8
-LOT_SAFE = 0.10
-LOT_TREND = 0.05
+TIMEFRAME_15 = "M15"
+TIMEFRAME_5 = "M5"
 
-STATS_FILE = "stats.json"
-try:
-    with open(STATS_FILE, 'r') as f:
-        STATS = json.load(f)
-except:
-    STATS = {"wins":0,"losses":0,"total":0,"history":[]}
+# V6 Filters
+EMA_PERIOD = 50
+RSI_MIN = 50
+RSI_MAX = 65
+SL_DISTANCE = 9.0      # $9
+TP1_DISTANCE = 6.0     # $6 - sure hit
+TP2_DISTANCE = 11.0    # $11 - momentum
+SPREAD_BUFFER_ENTRY = 0.60
+SPREAD_BUFFER_SL = 0.50
 
-def save_stats():
-    try:
-        with open(STATS_FILE, 'w') as f:
-            json.dump(STATS, f, indent=2)
-    except:
-        pass
+# ========= INDICATORS =========
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def get_squeeze(df):
+    # Bollinger + Keltner squeeze
+    sma20 = df['close'].rolling(20).mean()
+    std20 = df['close'].rolling(20).std()
+    upper_bb = sma20 + std20*2
+    lower_bb = sma20 - std20*2
+    # Keltner simplified
+    atr = (df['high']-df['low']).rolling(20).mean()
+    upper_kc = sma20 + atr*1.5
+    lower_kc = sma20 - atr*1.5
+    squeeze_on = (lower_bb > lower_kc) & (upper_bb < upper_kc)
+    return squeeze_on
+
+def find_fvg(df):
+    # 15M Bullish FVG: low[0] > high[2]
+    fvg_list = []
+    for i in range(2, len(df)):
+        if df['low'].iloc[i] > df['high'].iloc[i-2]:
+            fvg_list.append((df['low'].iloc[i], df['high'].iloc[i-2], i))
+    return fvg_list[-1] if fvg_list else None
+
+def find_bos(df, direction="bull"):
+    # 5M BOS: close breaks last swing high
+    last_high = df['high'].rolling(10).max().iloc[-2]
+    if direction == "bull" and df['close'].iloc[-1] > last_high:
+        return True
+    last_low = df['low'].rolling(10).min().iloc[-2]
+    if direction == "bear" and df['close'].iloc[-1] < last_low:
+        return True
+    return False
+
+def find_next_liquidity(df, direction="bull"):
+    # Next Buy Side Liquidity = recent swing high / equal highs
+    if direction == "bull":
+        # last 20 candles high
+        liquidity = df['high'].rolling(5).max().iloc[-20:].max()
+        # add wick buffer $1.5 for liquidity grab
+        return liquidity + 1.5
+    else:
+        liquidity = df['low'].rolling(5).min().iloc[-20:].min()
+        return liquidity - 1.5
 
 def send_telegram(msg):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-        requests.post(url, data=payload, timeout=10)
-        print(f"[TG] Sent: {msg[:50]}")
-    except Exception as e:
-        print(f"[TG ERROR] {e}")
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
 
-def get_live_price():
-    """ REAL Onana XAUUSD Spot Price """
-    try:
-        r = requests.get("https://api.gold-api.com/price/XAU", timeout=10)
-        data = r.json()
-        price = float(data.get("price", 0))
-        if price > 100:
-            print(f"[PRICE] Real Gold: {price}")
-            return price
-    except Exception as e:
-        print(f"[PRICE ERROR] {e}")
+# ========= MAIN LOOP =========
+def check_signal(df_1h, df_15, df_5):
+    # Filters
+    ema_1h = ema(df_1h['close'], EMA_PERIOD).iloc[-1]
+    ema_15 = ema(df_15['close'], EMA_PERIOD).iloc[-1]
+    rsi_15 = rsi(df_15['close']).iloc[-1]
+    squeeze_15 = get_squeeze(df_15)
 
-    # Fallback
-    try:
-        r = requests.get("https://api.metals.live/v1/spot", timeout=10)
-        data = r.json()
-        price = float(data[0]['gold'])
-        if price > 100:
-            return price
-    except:
-        pass
-    return 4179.11
+    # V6 STRICT CONDITIONS
+    if not (RSI_MIN <= rsi_15 <= RSI_MAX):
+        return None, f"Skip RSI {rsi_15:.1f} not in 50-65"
+    
+    # Squeeze must JUST turn OFF: previous ON, current OFF
+    if len(squeeze_15) < 2 or not (squeeze_15.iloc[-2] == True and squeeze_15.iloc[-1] == False):
+        return None, "Skip Squeeze not just OFF"
 
-def get_market_context(price):
-    # Replace this with your real EMA/RSI/FVG/BOS logic
-    # This is template - connect your TradingView/MT5 data
-    return {
-        "close": price,
-        "ema50": price - 15,
-        "ema50_rising": True,
-        "rsi": 67.2,
-        "fvg_bull": True,
-        "fvg_bear": False,
-        "bos_bull": True,
-        "bos_bear": False,
-        "hh_count": 3,
-        "squeeze": 0.0
-    }
+    if not (df_1h['close'].iloc[-1] > ema_1h and df_15['close'].iloc[-1] > ema_15):
+        return None, "Skip not above EMA50 1H+15M"
 
-def calculate_sl_tp(entry, is_long, is_safe_mode):
-    if is_safe_mode:
-        sl_d = SL_POINTS
-        tp_d = TP1_POINTS
-        lot = LOT_SAFE
-    else:
-        sl_d = TREND_SL
-        tp_d = TP2_POINTS
-        lot = LOT_TREND
+    fvg = find_fvg(df_15)
+    if not fvg:
+        return None, "No FVG"
 
-    sl = entry - sl_d if is_long else entry + sl_d
-    tp = entry + tp_d if is_long else entry - tp_d
-    return sl, tp, lot, sl_d, tp_d
+    if not find_bos(df_5, "bull"):
+        return None, "No 5M BOS"
 
-def check_signal():
-    price = get_live_price()
-    d = get_market_context(price)
+    # ENTRY + BUFFERS
+    entry_raw = df_15['close'].iloc[-1]
+    entry = entry_raw + SPREAD_BUFFER_ENTRY
+    sl = entry - SL_DISTANCE - SPREAD_BUFFER_SL
+    
+    tp1 = entry + TP1_DISTANCE
+    tp2 = entry + TP2_DISTANCE
+    tp3 = find_next_liquidity(df_15, "bull")
 
-    has_fvg = d["fvg_bull"] or d["fvg_bear"]
-    has_bos = d["bos_bull"] or d["bos_bear"]
+    msg = f"""🚀 V6 LONG SIGNAL - 80% SETUP
+Symbol: XAUUSD
+Entry: {entry:.2f}
+SL: {sl:.2f} (-${SL_DISTANCE})
 
-    is_uptrend = d["ema50_rising"] and d["close"] > d["ema50"] and d["rsi"] > 60
-    is_downtrend = not d["ema50_rising"] and d["close"] < d["ema50"] and d["rsi"] < 40
+TP1: {tp1:.2f} (+${TP1_DISTANCE}) 30%
+TP2: {tp2:.2f} (+${TP2_DISTANCE}) 30%
+TP3: {tp3:.2f} (Next Liquidity BSL) 40% 🎯
 
-    safe_mode = has_fvg and has_bos
-    trend_mode = (is_uptrend or is_downtrend) and d["hh_count"] >= 2 and d["squeeze"] == 0
-    valid = safe_mode or (trend_mode and has_bos)
-
-    if not valid:
-        return None
-
-    is_long = d["bos_bull"] or d["fvg_bull"] or is_uptrend
-    mode_name = "SAFE ✅ 80-85% WR" if safe_mode else "TREND ⚠️ 70-75% WR"
-    conf = 90 if safe_mode else 75
-
-    sl, tp, lot, sl_d, tp_d = calculate_sl_tp(d["close"], is_long, safe_mode)
-    rr = tp_d / sl_d
-
-    # Winrate display
-    total = STATS["total"]
-    wr = (STATS["wins"]/total*100) if total>0 else 0
-
-    msg = f"""
-🚀 *GAINZALGO V5 {'LONG' if is_long else 'SHORT'} - {conf}% {mode_name}*
-
-*WHY:*
-{'✅ 15M FVG Found' if has_fvg else f'⚠️ NO FVG but 1H {d["hh_count"]}x HH Strong Trend'}
-{'✅ 5M BOS Confirm' if has_bos else ''}
-{'✅ Above EMA50' if d['close'] > d['ema50'] else '✅ Below EMA50'} RSI: {d['rsi']:.1f}
-Squeeze: {'OFF - Trending' if d['squeeze']==0 else 'ON'}
-
-*80%+ SETUP:*
-Entry: `{d['close']:.2f}`
-SL: `{sl:.2f}` (-${sl_d})
-TP: `{tp:.2f}` (+${tp_d})
-Lot: {lot} | RR: 1:{rr:.2f}
-BE: +${BREAKEVEN_AT} -> SL to entry
-
-*STATS:* WR {wr:.1f}% ({STATS['wins']}W/{STATS['losses']}L/{total}T)
-_P/L: SAFE +${TP1_POINTS*100*lot} | TREND +${TP2_POINTS*100*lot}_
+Filters: RSI {rsi_15:.1f} | EMA50 OK | Squeeze OFF→ON | FVG+5M BOS
+No BE - Manage manually | 0.05 lot = TP1 $9 / TP2 $16.5 / TP3 ~${(tp3-entry)*5:.1f}
 """
-    return msg.strip(), is_long, d["close"], sl, tp, lot, mode_name
+    return msg, "OK"
 
-def handle_win_loss(is_win, entry, exit_price, mode, lot):
-    STATS["total"] += 1
-    if is_win:
-        STATS["wins"] += 1
-    else:
-        STATS["losses"] += 1
-    STATS["history"].append({
-        "win": is_win,
-        "entry": entry,
-        "exit": exit_price,
-        "mode": mode,
-        "lot": lot,
-        "time": datetime.now().isoformat()
-    })
-    # Keep last 50
-    if len(STATS["history"]) > 50:
-        STATS["history"] = STATS["history"][-50:]
-    save_stats()
+# --- Replace this with your MT5 / data feed ---
+def get_data():
+    # TODO: Connect to MT5 or your data API
+    # df_1h, df_15, df_5 = mt5_get_data()
+    # For now dummy
+    pass
 
-    wr = STATS["wins"]/STATS["total"]*100 if STATS["total"]>0 else 0
-    pnl = (exit_price - entry)*100*lot if is_win else -(entry - exit_price)*100*lot
-    if not is_win and (exit_price < entry): # short case
-        pnl = (entry - exit_price)*100*lot if is_win else -(exit_price - entry)*100*lot
-
-    send_telegram(f"{'✅ WIN' if is_win else '❌ LOSS'} {mode}\nEntry: {entry} -> Exit: {exit_price}\nP/L: ${pnl:.2f} | WR: {wr:.1f}%")
-
-# ===== MAIN LOOP =====
-print("GAINZALGO V5 80%+ ONLINE - XAUUSD Hunting")
-send_telegram("🤖 *GAINZALGO V5 80%+ ONLINE*\nSAFE SL9/TP13 | TREND SL12/TP18\nBreakeven +$8 | Stats tracking\nHunting Onana Gold...")
-
-active_trade = None
-
-while True:
-    try:
-        price = get_live_price()
-
-        # Breakeven logic
-        if active_trade:
-            is_long = active_trade["is_long"]
-            entry = active_trade["entry"]
-            pnl = price - entry if is_long else entry - price
-
-            if pnl >= BREAKEVEN_AT and active_trade["sl"]!= entry:
-                active_trade["sl"] = entry
-                active_trade["be_done"] = True
-                send_telegram(f"🔒 *BREAKEVEN HIT* +${pnl:.2f}\nEntry {entry} -> SL moved to entry! Risk free!")
-                print(f"[BE] Locked {entry}")
-
-            # Check SL/TP hit
-            if is_long:
-                if price <= active_trade["sl"]:
-                    handle_win_loss(False, entry, price, active_trade["mode"], active_trade["lot"])
-                    active_trade = None
-                elif price >= active_trade["tp"]:
-                    handle_win_loss(True, entry, price, active_trade["mode"], active_trade["lot"])
-                    active_trade = None
-            else:
-                if price >= active_trade["sl"]:
-                    handle_win_loss(False, entry, price, active_trade["mode"], active_trade["lot"])
-                    active_trade = None
-                elif price <= active_trade["tp"]:
-                    handle_win_loss(True, entry, price, active_trade["mode"], active_trade["lot"])
-                    active_trade = None
-
-        # New signal
-        if not active_trade:
-            result = check_signal()
-            if result:
-                msg, is_long, entry, sl, tp, lot, mode = result
-                send_telegram(msg)
-                active_trade = {"entry":entry,"sl":sl,"tp":tp,"is_long":is_long,"lot":lot,"mode":mode,"be_done":False}
-                print(f"[SIGNAL] {mode} {entry} SL:{sl} TP:{tp}")
-                time.sleep(900) # 15 min cooldown
-
-        time.sleep(30)
-
-    except Exception as e:
-        print(f"[ERROR] {e}")
-        traceback.print_exc()
-        time.sleep(30)
+if __name__ == "__main__":
+    while True:
+        try:
+            # df_1h, df_15, df_5 = get_data()
+            # signal, reason = check_signal(df_1h, df_15, df_5)
+            # if signal:
+            #     send_telegram(signal)
+            # else:
+            #     print(reason)
+            pass
+        except Exception as e:
+            print(e)
+        time.sleep(60)
